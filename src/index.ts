@@ -1,8 +1,8 @@
-import axios from 'axios';
-import { parse, stringify } from 'querystring';
-import pino from 'pino';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
-import { CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
+import { CloudFrontRequest, CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
+import axios from 'axios';
+import pino from 'pino';
+import { parse, stringify } from 'querystring';
 import { CookieAttributes, Cookies } from './util/cookie';
 
 interface AuthenticatorParams {
@@ -17,6 +17,12 @@ interface AuthenticatorParams {
   logLevel?: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
 }
 
+interface Tokens {
+  accessToken?: string;
+  idToken?: string;
+  refreshToken?: string;
+}
+
 export class Authenticator {
   _region: string;
   _userPoolId: string;
@@ -28,7 +34,7 @@ export class Authenticator {
   _httpOnly: boolean;
   _cookieBase: string;
   _logger;
-  _jwtVerifier;
+  _jwtVerifier: ReturnType<typeof CognitoJwtVerifier.create>;
 
   constructor(params: AuthenticatorParams) {
     this._verifyParams(params);
@@ -83,7 +89,7 @@ export class Authenticator {
    * @param  {String} code        Authorization code.
    * @return {Promise} Authenticated user tokens.
    */
-  _fetchTokensFromCode(redirectURI, code) {
+  _fetchTokensFromCode(redirectURI, code): Promise<Tokens> {
     const authorization = this._userPoolAppSecret && Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString('base64');
     const request = {
       url: `https://${this._userPoolDomain}/oauth2/token`,
@@ -103,7 +109,11 @@ export class Authenticator {
     return axios.request(request)
       .then(resp => {
         this._logger.debug({ msg: 'Fetched tokens', tokens: resp.data });
-        return resp.data;
+        return {
+          idToken: resp.data.id_token,
+          accessToken: resp.data.access_token,
+          refreshToken: resp.data.refresh_token,
+        };
       })
       .catch(err => {
         this._logger.error({ msg: 'Unable to fetch tokens from grant code', request, code });
@@ -118,9 +128,9 @@ export class Authenticator {
    * @param  {String} location Path to redirection.
    * @return {Object} Lambda@Edge response.
    */
-  async _getRedirectResponse(tokens, domain, location) {
-    const decoded = await this._jwtVerifier.verify(tokens.id_token);
-    const username = decoded['cognito:username'];
+  async _getRedirectResponse(tokens:Tokens, domain: string, location: string): Promise<CloudFrontRequestResult> {
+    const decoded = await this._jwtVerifier.verify(tokens.idToken);
+    const username = decoded['cognito:username'] as string;
     const usernameBase = `${this._cookieBase}.${username}`;
     const cookieAttributes: CookieAttributes = {
       domain: this._disableCookieDomain ? undefined : domain,
@@ -129,14 +139,14 @@ export class Authenticator {
       httpOnly: this._httpOnly,
     };
     const cookies = [
-      Cookies.serialize(`${usernameBase}.accessToken`, tokens.access_token, cookieAttributes),
-      Cookies.serialize(`${usernameBase}.idToken`, tokens.id_token, cookieAttributes),
-      Cookies.serialize(`${usernameBase}.refreshToken`, tokens.refresh_token, cookieAttributes),
+      Cookies.serialize(`${usernameBase}.accessToken`, tokens.accessToken, cookieAttributes),
+      Cookies.serialize(`${usernameBase}.idToken`, tokens.idToken, cookieAttributes),
+      ...(tokens.refreshToken ? [Cookies.serialize(`${usernameBase}.refreshToken`, tokens.refreshToken, cookieAttributes)] : []),
       Cookies.serialize(`${usernameBase}.tokenScopesString`, 'phone email profile openid aws.cognito.signin.user.admin', cookieAttributes),
       Cookies.serialize(`${this._cookieBase}.LastAuthUser`, username, cookieAttributes),
     ];
 
-    const response = {
+    const response: CloudFrontRequestResult = {
       status: '302' ,
       headers: {
         'location': [{
@@ -163,26 +173,66 @@ export class Authenticator {
   /**
    * Extract value of the authentication token from the request cookies.
    * @param  {Array}  cookieHeaders 'Cookie' request headers.
-   * @return {String} Extracted access token. Throw if not found.
+   * @return {Tokens | undefined} Extracted access token. Throw if not found.
    */
-  _getIdTokenFromCookie(cookieHeaders: Array<{ key?: string | undefined, value: string }>) {
+  _getTokensFromCookie(cookieHeaders: Array<{ key?: string | undefined, value: string }>): Tokens {
     this._logger.debug({ msg: 'Extracting authentication token from request cookie', cookieHeaders });
 
-    const tokenCookieNamePrefix = `${this._cookieBase}.`;
-    const tokenCookieNamePostfix = '.idToken';
-
     const cookies = cookieHeaders.flatMap(h => Cookies.parse(h.value));
-    const token = cookies.find(c => c.name.startsWith(tokenCookieNamePrefix) && c.name.endsWith(tokenCookieNamePostfix))?.value;
 
-    if (!token) {
-      this._logger.debug("idToken wasn't present in request cookies");
-      throw new Error("idToken isn't present in the request cookies");
+    const tokenCookieNamePrefix = `${this._cookieBase}.`;
+    const idTokenCookieNamePostfix = '.idToken';
+    const refreshTokenCookieNamePostfix = '.refreshToken';
+
+    const tokens: Tokens = {};
+    for (const cookie of cookies){
+      if (cookie.name.startsWith(tokenCookieNamePrefix) && cookie.name.endsWith(idTokenCookieNamePostfix)) {
+        tokens.idToken = cookie.value;
+      }
+      if (cookie.name.startsWith(tokenCookieNamePrefix) && cookie.name.endsWith(refreshTokenCookieNamePostfix)) {
+        tokens.refreshToken = cookie.value;
+      }
+    }
+    
+    if (!tokens.idToken && tokens.refreshToken) {
+      this._logger.debug('Neither idToken, nor refreshToken was present in request cookies');
+      throw new Error('Neither idToken, nor refreshToken was present in request cookies');
     }
 
-    this._logger.debug({ msg: 'Found idToken in cookie', token });
-    return token;
+    this._logger.debug({ msg: 'Found tokens in cookie', tokens });
+    return tokens;
   }
 
+  /**
+   * Get redirect to cognito usExtract va
+   * @param  {Array}  cookieHeaders 'Cookie' request headers.
+   * @return {Tokens | undefined} Extracted access token. Throw if not found.
+   */
+  _getRedirectToCognitoUserPoolResponse(request: CloudFrontRequest, redirectURI: string): CloudFrontRequestResult {
+    let redirectPath = request.uri;
+    if (request.querystring && request.querystring !== '') {
+      redirectPath += encodeURIComponent('?' + request.querystring);
+    }
+    const userPoolUrl = `https://${this._userPoolDomain}/authorize?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
+    this._logger.debug(`Redirecting user to Cognito User Pool URL ${userPoolUrl}`);
+    return {
+      status: '302',
+      headers: {
+        'location': [{
+          key: 'Location',
+          value: userPoolUrl,
+        }],
+        'cache-control': [{
+          key: 'Cache-Control',
+          value: 'no-cache, no-store, max-age=0, must-revalidate',
+        }],
+        'pragma': [{
+          key: 'Pragma',
+          value: 'no-cache',
+        }],
+      },
+    };
+  }
   /**
    * Handle Lambda@Edge event:
    *   * if authentication cookie is present and valid: forward the request
@@ -200,41 +250,64 @@ export class Authenticator {
     const redirectURI = `https://${cfDomain}`;
 
     try {
-      const token = this._getIdTokenFromCookie(request.headers.cookie);
-      this._logger.debug({ msg: 'Verifying token...', token });
-      const user = await this._jwtVerifier.verify(token);
+      const tokens = this._getTokensFromCookie(request.headers.cookie);
+      this._logger.debug({ msg: 'Verifying token...', tokens });
+      const user = await this._jwtVerifier.verify(tokens.idToken).catch((err) => {
+        if (tokens.refreshToken) {
+          this._logger.debug({ msg: 'Verifying idToken failed, verifying refresh token instead...', tokens, err });
+          return this._fetchRefreshTokens(redirectURI, tokens.refreshToken)
+            .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state.toString()));
+        } else {
+          throw err;
+        }
+      });
       this._logger.info({ msg: 'Forwarding request', path: request.uri, user });
       return request;
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code)
-          .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state));
+          .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state.toString()));
       } else {
-        let redirectPath = request.uri;
-        if (request.querystring && request.querystring !== '') {
-          redirectPath += encodeURIComponent('?' + request.querystring);
-        }
-        const userPoolUrl = `https://${this._userPoolDomain}/authorize?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
-        this._logger.debug(`Redirecting user to Cognito User Pool URL ${userPoolUrl}`);
-        return {
-          status: '302',
-          headers: {
-            'location': [{
-              key: 'Location',
-              value: userPoolUrl,
-            }],
-            'cache-control': [{
-              key: 'Cache-Control',
-              value: 'no-cache, no-store, max-age=0, must-revalidate',
-            }],
-            'pragma': [{
-              key: 'Pragma',
-              value: 'no-cache',
-            }],
-          },
-        };
+        return this._getRedirectToCognitoUserPoolResponse(request, redirectURI);
       }
     }
+  }
+
+  /**
+   * Exchange authorization code for tokens.
+   * @param  {String} redirectURI Redirection URI.
+   * @param  {String} code        Authorization code.
+   * @return {Promise} Authenticated user tokens.
+   */
+  _fetchRefreshTokens(redirectURI: string, refreshToken: string): Promise<Tokens> {
+    const authorization = this._userPoolAppSecret && Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString('base64');
+    const request = {
+      url: `https://${this._userPoolDomain}/oauth2/token`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(authorization && {'Authorization': `Basic ${authorization}`}),
+      },
+      data: stringify({
+        client_id:	this._userPoolAppId,
+        refresh_token:	refreshToken,
+        grant_type:	'refresh_token',
+        redirect_uri:	redirectURI,
+      }),
+    } as const;
+    this._logger.debug({ msg: 'Fetching tokens from refreshToken...', request, refreshToken });
+    return axios.request(request)
+      .then(resp => {
+        this._logger.debug({ msg: 'Fetched tokens', tokens: resp.data });
+        return {
+          idToken: resp.data.id_token,
+          accessToken: resp.data.access_token,
+        }as Tokens;
+      })
+      .catch(err => {
+        this._logger.error({ msg: 'Unable to fetch tokens from refreshToken', request, refreshToken });
+        throw err;
+      });
   }
 }
