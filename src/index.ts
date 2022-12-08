@@ -34,7 +34,7 @@ export class Authenticator {
   _httpOnly: boolean;
   _cookieBase: string;
   _logger;
-  _jwtVerifier: ReturnType<typeof CognitoJwtVerifier.create>;
+  _jwtVerifier;
 
   constructor(params: AuthenticatorParams) {
     this._verifyParams(params);
@@ -194,7 +194,7 @@ export class Authenticator {
       }
     }
     
-    if (!tokens.idToken && tokens.refreshToken) {
+    if (!tokens.idToken && !tokens.refreshToken) {
       this._logger.debug('Neither idToken, nor refreshToken was present in request cookies');
       throw new Error('Neither idToken, nor refreshToken was present in request cookies');
     }
@@ -202,7 +202,43 @@ export class Authenticator {
     this._logger.debug({ msg: 'Found tokens in cookie', tokens });
     return tokens;
   }
-
+  /**
+   * Fetch accessTokens from refreshToken.
+   * @param  {String} redirectURI Redirection URI.
+   * @param  {String} refreshToken Refresh tooken.
+   * @return {Promise<Tokens>} Refreshed user tokens.
+   */
+  _fetchTokensFromRefreshToken(redirectURI: string, refreshToken: string): Promise<Tokens> {
+    const authorization = this._userPoolAppSecret && Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString('base64');
+    const request = {
+      url: `https://${this._userPoolDomain}/oauth2/token`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(authorization && {'Authorization': `Basic ${authorization}`}),
+      },
+      data: stringify({
+        client_id:	this._userPoolAppId,
+        refresh_token:	refreshToken,
+        grant_type:	'refresh_token',
+        redirect_uri:	redirectURI,
+      }),
+    } as const;
+    this._logger.debug({ msg: 'Fetching tokens from refreshToken...', request, refreshToken });
+    return axios.request(request)
+      .then(resp => {
+        this._logger.debug({ msg: 'Fetched tokens', tokens: resp.data });
+        return {
+          idToken: resp.data.id_token,
+          accessToken: resp.data.access_token,
+        };
+      })
+      .catch(err => {
+        this._logger.error({ msg: 'Unable to fetch tokens from refreshToken', request, refreshToken });
+        throw err;
+      });
+  }
+  
   /**
    * Get redirect to cognito usExtract va
    * @param  {Array}  cookieHeaders 'Cookie' request headers.
@@ -252,62 +288,29 @@ export class Authenticator {
     try {
       const tokens = this._getTokensFromCookie(request.headers.cookie);
       this._logger.debug({ msg: 'Verifying token...', tokens });
-      const user = await this._jwtVerifier.verify(tokens.idToken).catch((err) => {
+      try {
+        const user = await this._jwtVerifier.verify(tokens.idToken);
+        this._logger.info({ msg: 'Forwarding request', path: request.uri, user });
+        return request;
+      } catch (err) {
         if (tokens.refreshToken) {
           this._logger.debug({ msg: 'Verifying idToken failed, verifying refresh token instead...', tokens, err });
-          return this._fetchRefreshTokens(redirectURI, tokens.refreshToken)
-            .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state.toString()));
+          return this._fetchTokensFromRefreshToken(redirectURI, tokens.refreshToken)
+            .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state as string));
         } else {
           throw err;
         }
-      });
-      this._logger.info({ msg: 'Forwarding request', path: request.uri, user });
-      return request;
+      }
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code)
-          .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state.toString()));
+          .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state as string));
       } else {
         return this._getRedirectToCognitoUserPoolResponse(request, redirectURI);
       }
     }
   }
 
-  /**
-   * Exchange authorization code for tokens.
-   * @param  {String} redirectURI Redirection URI.
-   * @param  {String} code        Authorization code.
-   * @return {Promise} Authenticated user tokens.
-   */
-  _fetchRefreshTokens(redirectURI: string, refreshToken: string): Promise<Tokens> {
-    const authorization = this._userPoolAppSecret && Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString('base64');
-    const request = {
-      url: `https://${this._userPoolDomain}/oauth2/token`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        ...(authorization && {'Authorization': `Basic ${authorization}`}),
-      },
-      data: stringify({
-        client_id:	this._userPoolAppId,
-        refresh_token:	refreshToken,
-        grant_type:	'refresh_token',
-        redirect_uri:	redirectURI,
-      }),
-    } as const;
-    this._logger.debug({ msg: 'Fetching tokens from refreshToken...', request, refreshToken });
-    return axios.request(request)
-      .then(resp => {
-        this._logger.debug({ msg: 'Fetched tokens', tokens: resp.data });
-        return {
-          idToken: resp.data.id_token,
-          accessToken: resp.data.access_token,
-        }as Tokens;
-      })
-      .catch(err => {
-        this._logger.error({ msg: 'Unable to fetch tokens from refreshToken', request, refreshToken });
-        throw err;
-      });
-  }
+
 }

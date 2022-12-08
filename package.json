@@ -15,7 +15,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "jest --coverage"
+    "test": "jest --coverage",
+    "postinstall": "tsc"
   },
   "dependencies": {
     "aws-jwt-verify": "^2.1.1",
